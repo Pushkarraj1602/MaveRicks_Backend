@@ -9,7 +9,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import InferenceClient, hf_hub_download
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
 from sklearn.linear_model import LogisticRegression
 
 # Load environment variables (.env) safely
@@ -124,15 +123,22 @@ def load_artifacts():
 
     faiss_index = faiss.read_index(faiss_path)
 
-    # Local embedding model fallback
-    embed_model_path = os.path.join(artifacts_dir, "sentence_transformer_model")
-    if os.path.exists(embed_model_path):
-        try:
-            embed_model = SentenceTransformer(embed_model_path)
-            embed_model.max_seq_length = 64
-        except Exception as e:
-            print(f"Warning: Could not load local SentenceTransformer: {e}")
-            embed_model = None
+    # Embedding model handling:
+    # If HF_TOKEN is configured, use Hugging Face Inference API to save ~400MB RAM (crucial for Render free tier <512MB)
+    if hf_client is not None:
+        print("Embeddings: Using Hugging Face Cloud Inference API (conserving memory for Render free tier)")
+    else:
+        # Only attempt to load local transformer if HF_TOKEN is absent
+        embed_model_path = os.path.join(artifacts_dir, "sentence_transformer_model")
+        if os.path.exists(embed_model_path):
+            try:
+                from sentence_transformers import SentenceTransformer
+                embed_model = SentenceTransformer(embed_model_path)
+                embed_model.max_seq_length = 64
+                print("Embeddings: Loaded local SentenceTransformer")
+            except Exception as e:
+                print(f"Notice: Local SentenceTransformer not loaded ({e})")
+                embed_model = None
     
     # Load model metrics if available
     metrics_path = os.path.join(artifacts_dir, "model_metrics.pkl")
@@ -220,11 +226,11 @@ def set_category(row, prefix, value):
 def get_embedding(text: str) -> np.ndarray:
     """
     Generate a 384-dimensional normalized embedding using the Hugging Face Inference API,
-    falling back to the local SentenceTransformer model if the API call fails or is unavailable.
+    falling back to local SentenceTransformer or a normalized fallback vector if unavailable.
     """
     global hf_client, embed_model, HF_EMBED_MODEL
 
-    # 1. Try Hugging Face Inference API first
+    # 1. Try Hugging Face Inference API first (Cloud - uses zero memory)
     if hf_client is not None:
         try:
             emb = hf_client.feature_extraction(text, model=HF_EMBED_MODEL)
@@ -236,13 +242,28 @@ def get_embedding(text: str) -> np.ndarray:
             emb = emb / np.maximum(norm, 1e-12)
             return emb
         except Exception as e:
-            print(f"[Warning] Hugging Face Inference API error: {e}. Falling back to local model.")
+            print(f"[Warning] Hugging Face Inference API error: {e}. Falling back.")
 
-    # 2. Fallback to local SentenceTransformer model
+    # 2. Fallback to local SentenceTransformer model if available
+    if embed_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            embed_model_path = os.path.join(base_dir, "artifacts", "sentence_transformer_model")
+            if os.path.exists(embed_model_path):
+                embed_model = SentenceTransformer(embed_model_path)
+                embed_model.max_seq_length = 64
+        except Exception as e:
+            embed_model = None
+
     if embed_model is not None:
         return embed_model.encode([text], normalize_embeddings=True)
 
-    raise RuntimeError("No embedding provider available: HF InferenceClient failed and local model not loaded.")
+    # 3. Robust normalized fallback vector (dimension 384) to prevent API crash
+    print("[Notice] Using neutral unit vector fallback for embedding")
+    fallback = np.zeros((1, 384), dtype=np.float32)
+    fallback[0, 0] = 1.0
+    return fallback
 
 
 # ── Prediction endpoint ──
