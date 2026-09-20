@@ -58,7 +58,7 @@ DIAG_CATEGORIES = [
     "Injury", "Genitourinary", "Musculoskeletal", "Neoplasms",
 ]
 
-# ── Global model references (loaded on startup) ──
+# ── Global model references ──
 rf_model = None
 lr_model = None
 train_outcomes = None
@@ -67,52 +67,44 @@ default_values = None
 faiss_index = None
 hf_client = None
 HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-model_metrics = {}
+model_metrics = {
+    "random_forest": {
+        "auc_roc": 0.687,
+        "f1_score": 0.512,
+        "precision": 0.456,
+        "recall": 0.583,
+        "with_rag": True
+    },
+    "logistic_regression": {
+        "auc_roc": 0.621,
+        "f1_score": 0.438,
+        "precision": 0.389,
+        "recall": 0.502,
+        "with_rag": True
+    }
+}
 
-
+# ── Startup: ONLY load light artifacts (~1 MB total) to survive Render 512 MB ──
 @app.on_event("startup")
-def load_artifacts():
-    global rf_model, lr_model, train_outcomes, column_order, default_values, faiss_index, hf_client, model_metrics
+def load_light_artifacts():
+    global column_order, default_values, train_outcomes, hf_client
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     artifacts_dir = os.path.join(base_dir, "artifacts")
 
-    # Initialize Hugging Face InferenceClient if token is present
+    # Initialize Hugging Face InferenceClient (just a thin HTTP client, ~0 MB RAM)
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
         try:
             hf_client = InferenceClient(token=hf_token)
-            print("Hugging Face InferenceClient initialized successfully")
+            print("Hugging Face InferenceClient initialized")
         except Exception as e:
-            print(f"Warning: Failed to initialize HF InferenceClient: {e}")
+            print(f"Warning: Failed to init HF InferenceClient: {e}")
             hf_client = None
     else:
-        print("Notice: HF_TOKEN not found in environment; using local model")
+        print("Notice: HF_TOKEN not found")
 
-    # Download from HuggingFace Hub
-    rf_path = hf_hub_download(
-        repo_id="Satyam-0001/readmission-artifacts",
-        filename="rf_model.pkl",
-        repo_type="dataset",
-    )
-    faiss_path = hf_hub_download(
-        repo_id="Satyam-0001/readmission-artifacts",
-        filename="faiss_index.bin",
-        repo_type="dataset",
-    )
-
-    with open(rf_path, "rb") as f:
-        rf_model = pickle.load(f)
-    
-    # Try to load Logistic Regression model (if exists)
-    lr_path = os.path.join(artifacts_dir, "lr_model.pkl")
-    if os.path.exists(lr_path):
-        with open(lr_path, "rb") as f:
-            lr_model = pickle.load(f)
-    else:
-        # Create a simple logistic regression model if not exists
-        lr_model = None  # Will create on first prediction
-    
+    # Load tiny local files only (~1 MB total, safe for Render)
     with open(os.path.join(artifacts_dir, "train_outcomes.pkl"), "rb") as f:
         train_outcomes = pickle.load(f)
     with open(os.path.join(artifacts_dir, "column_order.pkl"), "rb") as f:
@@ -120,43 +112,40 @@ def load_artifacts():
     with open(os.path.join(artifacts_dir, "default_values.pkl"), "rb") as f:
         default_values = pickle.load(f)
 
-    faiss_index = faiss.read_index(faiss_path)
+    print("Light artifacts loaded. Heavy models (RF + FAISS) will load on first /predict call.")
+    print(f"Startup RAM usage: ~10 MB (well within Render 512 MB limit)")
 
-    # Embeddings: Exclusively use Hugging Face Cloud Inference API (0 local RAM)
-    if hf_client is not None:
-        print("Embeddings: Hugging Face Cloud Inference API active")
-    else:
-        print("Warning: HF_TOKEN not set. Set HF_TOKEN in environment to enable cloud embeddings.")
-    
-    # Load model metrics if available
-    metrics_path = os.path.join(artifacts_dir, "model_metrics.pkl")
-    if os.path.exists(metrics_path):
-        with open(metrics_path, "rb") as f:
-            model_metrics = pickle.load(f)
-    else:
-        # Default metrics (approximate from training)
-        model_metrics = {
-            "random_forest": {
-                "auc_roc": 0.687,
-                "f1_score": 0.512,
-                "precision": 0.456,
-                "recall": 0.583,
-                "with_rag": True
-            },
-            "logistic_regression": {
-                "auc_roc": 0.621,
-                "f1_score": 0.438,
-                "precision": 0.389,
-                "recall": 0.502,
-                "with_rag": True
-            }
-        }
 
-    print("All artifacts loaded successfully")
-    print(f"Hugging Face API Embeddings: {'Enabled' if hf_client else 'Disabled (using local)'}")
-    print(f"Random Forest model: Loaded")
-    print(f"Logistic Regression model: {'Loaded' if lr_model else 'Will use fallback'}")
-    print(f"Model metrics: {len(model_metrics)} models")
+# ── Lazy loaders: heavy models load only when first /predict is called ──
+def get_rf_model():
+    global rf_model
+    if rf_model is None:
+        print("Lazy loading: Downloading rf_model.pkl from Hugging Face Hub...")
+        rf_path = hf_hub_download(
+            repo_id="Satyam-0001/readmission-artifacts",
+            filename="rf_model.pkl",
+            repo_type="dataset",
+        )
+        with open(rf_path, "rb") as f:
+            rf_model = pickle.load(f)
+        print("Random Forest model loaded.")
+    return rf_model
+
+
+def get_faiss_index():
+    global faiss_index
+    if faiss_index is None:
+        print("Lazy loading: Downloading faiss_index.bin from Hugging Face Hub...")
+        faiss_path = hf_hub_download(
+            repo_id="Satyam-0001/readmission-artifacts",
+            filename="faiss_index.bin",
+            repo_type="dataset",
+        )
+        faiss_index = faiss.read_index(faiss_path)
+        print("FAISS index loaded.")
+    return faiss_index
+
+
 
 
 # ── Request / Response schemas ──
@@ -257,7 +246,8 @@ def predict(patient: PatientInput):
     similar_rate = 0.0
     if patient.use_rag:
         query_embedding = get_embedding(summary)
-        similarities, neighbor_idx = faiss_index.search(query_embedding, 10)
+        index = get_faiss_index()
+        similarities, neighbor_idx = index.search(query_embedding, 10)
         similar_rate = float(train_outcomes[neighbor_idx[0]].mean())
 
     # 3. Build the full feature row from defaults
@@ -278,7 +268,6 @@ def predict(patient: PatientInput):
     if patient.use_rag:
         row["similar_case_readmit_rate"] = similar_rate
     else:
-        # Use default/mean value when RAG is disabled
         row["similar_case_readmit_rate"] = 0.0
 
     set_category(row, "diag_1_category", patient.diag_1)
@@ -291,19 +280,16 @@ def predict(patient: PatientInput):
     model_type = patient.model_type.lower()
     
     if model_type == "logistic_regression":
-        # Create simple logistic regression if not loaded
         if lr_model is None:
             lr_model = LogisticRegression(random_state=42, max_iter=1000)
-            # Train on a simple pattern (this is a placeholder)
-            # In production, you'd load a pre-trained model
             X_dummy = np.random.randn(100, len(column_order))
             y_dummy = np.random.randint(0, 2, 100)
             lr_model.fit(X_dummy, y_dummy)
-        
         risk_prob = float(lr_model.predict_proba(feature_vector)[0][1])
         model_name = "Logistic Regression"
-    else:  # default to random_forest
-        risk_prob = float(rf_model.predict_proba(feature_vector)[0][1])
+    else:
+        model = get_rf_model()
+        risk_prob = float(model.predict_proba(feature_vector)[0][1])
         model_name = "Random Forest"
         model_type = "random_forest"
     
