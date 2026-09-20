@@ -29,12 +29,17 @@ except ImportError:
 app = FastAPI(title="Hospital Readmission Predictor API")
 
 cors_origins = [
+    # Local development
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:5174",
     "http://127.0.0.1:5174",
+    # Production frontend
+    "https://mavericks.rajpushkar.me",
+    "https://www.mavericks.rajpushkar.me",
 ]
 
+# Also allow any additional domains from FRONTEND_URL env variable
 frontend_url_env = os.getenv("FRONTEND_URL", "")
 if frontend_url_env:
     for url in frontend_url_env.split(","):
