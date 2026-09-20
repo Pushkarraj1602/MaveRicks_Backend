@@ -65,7 +65,6 @@ train_outcomes = None
 column_order = None
 default_values = None
 faiss_index = None
-embed_model = None
 hf_client = None
 HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 model_metrics = {}
@@ -73,7 +72,7 @@ model_metrics = {}
 
 @app.on_event("startup")
 def load_artifacts():
-    global rf_model, lr_model, train_outcomes, column_order, default_values, faiss_index, embed_model, hf_client, model_metrics
+    global rf_model, lr_model, train_outcomes, column_order, default_values, faiss_index, hf_client, model_metrics
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     artifacts_dir = os.path.join(base_dir, "artifacts")
@@ -123,22 +122,11 @@ def load_artifacts():
 
     faiss_index = faiss.read_index(faiss_path)
 
-    # Embedding model handling:
-    # If HF_TOKEN is configured, use Hugging Face Inference API to save ~400MB RAM (crucial for Render free tier <512MB)
+    # Embeddings: Exclusively use Hugging Face Cloud Inference API (0 local RAM)
     if hf_client is not None:
-        print("Embeddings: Using Hugging Face Cloud Inference API (conserving memory for Render free tier)")
+        print("Embeddings: Hugging Face Cloud Inference API active")
     else:
-        # Only attempt to load local transformer if HF_TOKEN is absent
-        embed_model_path = os.path.join(artifacts_dir, "sentence_transformer_model")
-        if os.path.exists(embed_model_path):
-            try:
-                from sentence_transformers import SentenceTransformer
-                embed_model = SentenceTransformer(embed_model_path)
-                embed_model.max_seq_length = 64
-                print("Embeddings: Loaded local SentenceTransformer")
-            except Exception as e:
-                print(f"Notice: Local SentenceTransformer not loaded ({e})")
-                embed_model = None
+        print("Warning: HF_TOKEN not set. Set HF_TOKEN in environment to enable cloud embeddings.")
     
     # Load model metrics if available
     metrics_path = os.path.join(artifacts_dir, "model_metrics.pkl")
@@ -225,12 +213,11 @@ def set_category(row, prefix, value):
 
 def get_embedding(text: str) -> np.ndarray:
     """
-    Generate a 384-dimensional normalized embedding using the Hugging Face Inference API,
-    falling back to local SentenceTransformer or a normalized fallback vector if unavailable.
+    Generate a 384-dimensional normalized embedding using Hugging Face Cloud Inference API.
+    Zero local RAM overhead.
     """
-    global hf_client, embed_model, HF_EMBED_MODEL
+    global hf_client, HF_EMBED_MODEL
 
-    # 1. Try Hugging Face Inference API first (Cloud - uses zero memory)
     if hf_client is not None:
         try:
             emb = hf_client.feature_extraction(text, model=HF_EMBED_MODEL)
@@ -242,25 +229,10 @@ def get_embedding(text: str) -> np.ndarray:
             emb = emb / np.maximum(norm, 1e-12)
             return emb
         except Exception as e:
-            print(f"[Warning] Hugging Face Inference API error: {e}. Falling back.")
+            print(f"[Warning] Hugging Face Cloud Inference API call failed: {e}")
 
-    # 2. Fallback to local SentenceTransformer model if available
-    if embed_model is None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            embed_model_path = os.path.join(base_dir, "artifacts", "sentence_transformer_model")
-            if os.path.exists(embed_model_path):
-                embed_model = SentenceTransformer(embed_model_path)
-                embed_model.max_seq_length = 64
-        except Exception as e:
-            embed_model = None
-
-    if embed_model is not None:
-        return embed_model.encode([text], normalize_embeddings=True)
-
-    # 3. Robust normalized fallback vector (dimension 384) to prevent API crash
-    print("[Notice] Using neutral unit vector fallback for embedding")
+    # Fallback neutral unit vector (dimension 384) to prevent API crash if network drops
+    print("[Notice] Using fallback normalized vector for embedding")
     fallback = np.zeros((1, 384), dtype=np.float32)
     fallback[0, 0] = 1.0
     return fallback
