@@ -74,18 +74,32 @@ hf_client = None
 HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 model_metrics = {
     "random_forest": {
-        "auc_roc": 0.687,
-        "f1_score": 0.512,
-        "precision": 0.456,
-        "recall": 0.583,
-        "with_rag": True
+        "auc_roc": 0.6473,
+        "f1_score": 0.2744,
+        "precision": 0.1948,
+        "recall": 0.4639,
+        "with_rag": True      
+    },
+    "random_forest_baseline": {
+        "auc_roc": 0.6463,
+        "f1_score": 0.2679,
+        "precision": 0.1911,
+        "recall": 0.4479,
+        "with_rag": False      
     },
     "logistic_regression": {
-        "auc_roc": 0.621,
-        "f1_score": 0.438,
-        "precision": 0.389,
-        "recall": 0.502,
-        "with_rag": True
+        "auc_roc": 0.6573,
+        "f1_score": 0.2685,
+        "precision": 0.1802,
+        "recall": 0.5263,
+        "with_rag": True       
+    },
+    "logistic_regression_baseline": {
+        "auc_roc": 0.6564,
+        "f1_score": 0.2689,
+        "precision": 0.1806,
+        "recall": 0.5263,
+        "with_rag": False      
     }
 }
 
@@ -149,6 +163,29 @@ def get_faiss_index():
         faiss_index = faiss.read_index(faiss_path)
         print("FAISS index loaded.")
     return faiss_index
+
+
+def get_lr_model():
+    global lr_model
+    if lr_model is None:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        local_path = os.path.join(base_dir, "artifacts", "lr_model.pkl")
+        if os.path.exists(local_path):
+            print("Loading lr_model.pkl from local artifacts...")
+            with open(local_path, "rb") as f:
+                lr_model = pickle.load(f)
+            print("Logistic Regression model loaded (local).")
+        else:
+            print("Lazy loading: Downloading lr_model.pkl from Hugging Face Hub...")
+            lr_path = hf_hub_download(
+                repo_id="Satyam-0001/readmission-artifacts",
+                filename="lr_model.pkl",
+                repo_type="dataset",
+            )
+            with open(lr_path, "rb") as f:
+                lr_model = pickle.load(f)
+            print("Logistic Regression model loaded (HF Hub).")
+    return lr_model
 
 
 
@@ -248,12 +285,16 @@ def predict(patient: PatientInput):
     )
 
     # 2. Embed and retrieve similar patients via FAISS (if RAG enabled)
-    similar_rate = 0.0
+    similar_rate_for_display = 0.0  # For display in UI
+    similar_rate_for_model = 0.0    # For model input feature
+    
     if patient.use_rag:
         query_embedding = get_embedding(summary)
         index = get_faiss_index()
         similarities, neighbor_idx = index.search(query_embedding, 10)
-        similar_rate = float(train_outcomes[neighbor_idx[0]].mean())
+        similar_rate_value = float(train_outcomes[neighbor_idx[0]].mean())
+        similar_rate_for_display = similar_rate_value  # Show in UI
+        similar_rate_for_model = similar_rate_value     # Use in model
 
     # 3. Build the full feature row from defaults
     row = dict(default_values)
@@ -269,11 +310,8 @@ def predict(patient: PatientInput):
     row["number_diagnoses"] = patient.number_diagnoses
     row["insulin"] = insulin_map[patient.insulin]
     
-    # Add RAG feature if enabled
-    if patient.use_rag:
-        row["similar_case_readmit_rate"] = similar_rate
-    else:
-        row["similar_case_readmit_rate"] = 0.0
+    # Always add RAG feature to model (use 0.0 if disabled)
+    row["similar_case_readmit_rate"] = similar_rate_for_model
 
     set_category(row, "diag_1_category", patient.diag_1)
     set_category(row, "diag_2_category", "Other")
@@ -285,12 +323,8 @@ def predict(patient: PatientInput):
     model_type = patient.model_type.lower()
     
     if model_type == "logistic_regression":
-        if lr_model is None:
-            lr_model = LogisticRegression(random_state=42, max_iter=1000)
-            X_dummy = np.random.randn(100, len(column_order))
-            y_dummy = np.random.randint(0, 2, 100)
-            lr_model.fit(X_dummy, y_dummy)
-        risk_prob = float(lr_model.predict_proba(feature_vector)[0][1])
+        model = get_lr_model()
+        risk_prob = float(model.predict_proba(feature_vector)[0][1])
         model_name = "Logistic Regression"
     else:
         model = get_rf_model()
@@ -298,19 +332,20 @@ def predict(patient: PatientInput):
         model_name = "Random Forest"
         model_type = "random_forest"
     
-    # 6. Get model metrics
-    metrics = model_metrics.get(model_type, {
+    # 6. Get model metrics (pick RAG or baseline based on patient.use_rag)
+    metrics_key = model_type if patient.use_rag else f"{model_type}_baseline"
+    metrics = model_metrics.get(metrics_key, model_metrics.get(model_type, {
         "auc_roc": 0.0,
         "f1_score": 0.0,
         "precision": 0.0,
         "recall": 0.0,
         "with_rag": patient.use_rag
-    })
+    }))
 
     return PredictionResponse(
         risk_probability=risk_prob,
         is_high_risk=risk_prob >= BEST_THRESHOLD,
-        similar_case_readmit_rate=similar_rate,
+        similar_case_readmit_rate=similar_rate_for_display,  # Show actual value or 0
         summary=summary,
         model_used=model_name,
         rag_enabled=patient.use_rag,
