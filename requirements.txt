@@ -3,7 +3,8 @@ uvicorn
 scikit-learn==1.6.1
 pandas
 numpy
-faiss-cpu
+# faiss-cpu  # Local FAISS path is retained in api.py comments for reference.
 huggingface_hub
+pinecone
 reportlab
 python-dotenv

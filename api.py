@@ -2,12 +2,13 @@ import os
 import pickle
 from typing import Optional
 
-import faiss
+# import faiss  # Replaced by Pinecone; kept for reference during migration.
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import InferenceClient, hf_hub_download
+from pinecone import Pinecone
 from pydantic import BaseModel
 from sklearn.linear_model import LogisticRegression
 
@@ -69,9 +70,12 @@ lr_model = None
 train_outcomes = None
 column_order = None
 default_values = None
-faiss_index = None
+# faiss_index = None  # Replaced by Pinecone; kept for reference during migration.
+pinecone_index = None
 hf_client = None
 HF_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "readmission-index")
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "readmission")
 model_metrics = {
     "random_forest": {
         "auc_roc": 0.6473,
@@ -131,7 +135,7 @@ def load_light_artifacts():
     with open(os.path.join(artifacts_dir, "default_values.pkl"), "rb") as f:
         default_values = pickle.load(f)
 
-    print("Light artifacts loaded. Heavy models (RF + FAISS) will load on first /predict call.")
+    print("Light artifacts loaded. Heavy RF model and Pinecone connection initialize on first /predict call.")
     print(f"Startup RAM usage: ~10 MB (well within Render 512 MB limit)")
 
 
@@ -151,18 +155,31 @@ def get_rf_model():
     return rf_model
 
 
-def get_faiss_index():
-    global faiss_index
-    if faiss_index is None:
-        print("Lazy loading: Downloading faiss_index.bin from Hugging Face Hub...")
-        faiss_path = hf_hub_download(
-            repo_id="Satyam-0001/readmission-artifacts",
-            filename="faiss_index.bin",
-            repo_type="dataset",
-        )
-        faiss_index = faiss.read_index(faiss_path)
-        print("FAISS index loaded.")
-    return faiss_index
+def get_pinecone_index():
+    global pinecone_index
+    if pinecone_index is None:
+        pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        if not pinecone_api_key:
+            raise RuntimeError("PINECONE_API_KEY is not configured.")
+        pinecone = Pinecone(api_key=pinecone_api_key)
+        pinecone_index = pinecone.Index(PINECONE_INDEX_NAME)
+        print(f"Pinecone index connected: {PINECONE_INDEX_NAME}")
+    return pinecone_index
+
+
+# Previous FAISS implementation, retained for reference:
+# def get_faiss_index():
+#     global faiss_index
+#     if faiss_index is None:
+#         print("Lazy loading: Downloading faiss_index.bin from Hugging Face Hub...")
+#         faiss_path = hf_hub_download(
+#             repo_id="Satyam-0001/readmission-artifacts",
+#             filename="faiss_index.bin",
+#             repo_type="dataset",
+#         )
+#         faiss_index = faiss.read_index(faiss_path)
+#         print("FAISS index loaded.")
+#     return faiss_index
 
 
 def get_lr_model():
@@ -284,15 +301,45 @@ def predict(patient: PatientInput):
         patient.num_medications, patient.time_in_hospital, patient.number_diagnoses,
     )
 
-    # 2. Embed and retrieve similar patients via FAISS (if RAG enabled)
+    # 2. Embed and retrieve similar patients via Pinecone (if RAG enabled)
     similar_rate_for_display = 0.0  # For display in UI
     similar_rate_for_model = 0.0    # For model input feature
     
     if patient.use_rag:
         query_embedding = get_embedding(summary)
-        index = get_faiss_index()
-        similarities, neighbor_idx = index.search(query_embedding, 10)
-        similar_rate_value = float(train_outcomes[neighbor_idx[0]].mean())
+        index = get_pinecone_index()
+        results = index.query(
+            vector=query_embedding[0].tolist(),
+            top_k=10,
+            include_metadata=True,
+            namespace=PINECONE_NAMESPACE,
+        )
+        matches = (
+            results.get("matches", [])
+            if isinstance(results, dict)
+            else getattr(results, "matches", [])
+        )
+        readmission_values = [
+            float(
+                (
+                    match.get("metadata", {})
+                    if isinstance(match, dict)
+                    else getattr(match, "metadata", {})
+                )["readmitted"]
+            )
+            for match in matches
+            if (
+                (
+                    match.get("metadata", {})
+                    if isinstance(match, dict)
+                    else getattr(match, "metadata", {})
+                ).get("readmitted")
+                is not None
+            )
+        ]
+        similar_rate_value = (
+            float(np.mean(readmission_values)) if readmission_values else 0.0
+        )
         similar_rate_for_display = similar_rate_value  # Show in UI
         similar_rate_for_model = similar_rate_value     # Use in model
 
